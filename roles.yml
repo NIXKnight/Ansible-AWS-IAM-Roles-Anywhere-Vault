@@ -1,0 +1,10 @@
+---
+# Install these requirements using:
+# ansible-galaxy install --roles-path ./external-roles -r ./requirements/roles.yml
+- name: pgsql_dbs_users
+  src: https://github.com/NIXKnight/Ansible-PgSQL-DB-User.git
+  version: master
+
+- name: acme
+  src: https://github.com/NIXKnight/Ansible-Acme.git
+  version: main

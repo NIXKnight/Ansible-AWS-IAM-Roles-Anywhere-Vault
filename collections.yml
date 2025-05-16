@@ -1,0 +1,10 @@
+---
+# Install the collections using:
+# ansible-galaxy collection install -p collections -r ./requirements/collections.yml
+collections:
+  - name: nixknight.docker
+    type: git
+    source: "git+https://github.com/NIXKnight/Ansible-Collections.git#/collections/nixknight/docker,main"
+  - name: nixknight.general
+    type: git
+    source: "git+https://github.com/NIXKnight/Ansible-Collections.git#/collections/nixknight/general,main"
