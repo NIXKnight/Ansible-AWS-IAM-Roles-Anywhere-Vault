@@ -1,0 +1,139 @@
+---
+# Secrets
+HASHI_VAULT_POSTGRES_DATABASE: "vault"
+HASHI_VAULT_POSTGRES_USERNAME: "master"
+HASHI_VAULT_POSTGRES_PASSWORD: !vault |
+  $ANSIBLE_VAULT;1.1;AES256
+  34666638356561303861656539613637366130663964646363306661316333636130366233343665
+  6163356333633866616336346563363735333766326437370a653761396464633434326536666364
+  39626132613565653966383836376362393162633533343839366166356231623664333463393664
+  3136363731396434380a303062663634356333353066363334613636343636393834313838313137
+  34386662303863323964613932653536346662343639663638383733623132666338
+
+HASHI_VAULT_SERVICE_NAME: "docker-hashi-vault"
+HASHI_VAULT_SERVICE_SYSTEMD_DESCRIPTION: "HashiCorp Vault Stack"
+HASHI_VAULT_SERVICE_SYSTEMD_REQUIRES: "network-online.target docker.service"
+HASHI_VAULT_SERVICE_SYSTEMD_AFTER: "network-online.target time-sync.target docker.service"
+HASHI_VAULT_SERVICE_SYSTEMD_FILE: "/etc/systemd/system/{{ DOCKER_COMPOSE_SERVICE_NAME }}.service"
+HASHI_VAULT_SERVICE_IMAGES:
+  postgresql:
+    name: "postgres"
+    tag: "16.9-bookworm"
+  vault:
+    name: "hashicorp/vault"
+    tag: "1.19.4"
+  utils:
+    name: "nixknight/kube-utils" # Contains everything that is needed to initialize and unseal Vault automatically via scripts/vault/vault_auto_unseal.py
+    tag: "v0.40"
+HASHI_VAULT_SERVICE_COMPOSE_PATH: "/etc/{{ HASHI_VAULT_SERVICE_NAME }}"
+HASHI_VAULT_COMPOSE_SERVICE_CONFIG_PATH: "{{ HASHI_VAULT_SERVICE_COMPOSE_PATH }}"
+
+PGSQL_IMAGE: "{{ HASHI_VAULT_SERVICE_IMAGES.postgresql.name }}:{{ HASHI_VAULT_SERVICE_IMAGES.postgresql.tag }}"
+VAULT_IMAGE: "{{ HASHI_VAULT_SERVICE_IMAGES.vault.name }}:{{ HASHI_VAULT_SERVICE_IMAGES.vault.tag }}"
+UTILS_IMAGE: "{{ HASHI_VAULT_SERVICE_IMAGES.utils.name }}:{{ HASHI_VAULT_SERVICE_IMAGES.utils.tag }}"
+
+HASHI_VAULT_COMPOSE_SERVICE_TEMPLATES:
+  - src: "{{ playbook_dir }}/templates/nginx/nginx_top_level.j2"
+    dest: "{{ HASHI_VAULT_COMPOSE_SERVICE_CONFIG_PATH }}/nginx_top_level.conf"
+    mode: 644
+    owner: "root"
+    group: "root"
+  - src: "{{ playbook_dir }}/templates/nginx/nginx_vault.conf.j2"
+    dest: "{{ HASHI_VAULT_COMPOSE_SERVICE_CONFIG_PATH }}/nginx_vault.conf"
+    mode: 644
+    owner: "root"
+    group: "root"
+  - src: "{{ playbook_dir }}/templates/vault/config.hcl.j2"
+    dest: "{{ HASHI_VAULT_COMPOSE_SERVICE_CONFIG_PATH }}/config.hcl"
+    mode: 644
+    owner: "root"
+    group: "root"
+HASHI_VAULT_COMPOSE_SERVICE_FILES:
+  - src: "{{ playbook_dir }}/scripts/vault/vault_auto_unseal.py"
+    dest: "{{ HASHI_VAULT_COMPOSE_SERVICE_CONFIG_PATH }}/vault_auto_unseal.py"
+    mode: 755
+    owner: "root"
+    group: "root"
+  - src: "{{ playbook_dir }}/scripts/postgresql/init.sh"
+    dest: "{{ HASHI_VAULT_COMPOSE_SERVICE_CONFIG_PATH }}/postgresql_init.sh"
+    mode: 755
+    owner: "root"
+    group: "root"
+
+HASHI_VAULT_SERVICE_MANIFEST:
+  dest: "{{ HASHI_VAULT_SERVICE_COMPOSE_PATH }}/docker-compose.yml"
+  content:
+    services:
+      postgres:
+        image: "{{ PGSQL_IMAGE }}"
+        environment:
+          POSTGRES_DB: "{{ HASHI_VAULT_POSTGRES_DATABASE }}"
+          POSTGRES_USER: "{{ HASHI_VAULT_POSTGRES_USERNAME }}"
+          POSTGRES_PASSWORD: "{{ HASHI_VAULT_POSTGRES_PASSWORD }}"
+        volumes:
+          - "postgres_data:/var/lib/postgresql/data"
+          - "{{ HASHI_VAULT_COMPOSE_SERVICE_CONFIG_PATH }}/postgresql_init.sh:/docker-entrypoint-initdb.d/init.sh"
+        network_mode: host
+        healthcheck:
+          test: ["CMD-SHELL", "pg_isready -U {{ HASHI_VAULT_POSTGRES_USERNAME }} -d {{ HASHI_VAULT_POSTGRES_DATABASE }} || exit 1"]
+          interval: 30s
+          timeout: 10s
+          retries: 5
+          start_period: 30s
+      nginx:
+        image: "{{ NGINX_IMAGE }}"
+        volumes:
+          - "/etc/localtime:/etc/localtime:ro"
+          - "{{ ACME_CERT_DIR }}:{{ ACME_CERT_DIR }}"
+          - "{{ HASHI_VAULT_COMPOSE_SERVICE_CONFIG_PATH }}/nginx_top_level.conf:/etc/nginx/conf.d/01_nginx_top_level.conf"
+          - "{{ HASHI_VAULT_COMPOSE_SERVICE_CONFIG_PATH }}/nginx_vault.conf:/etc/nginx/conf.d/default.conf"
+        network_mode: host
+      main:
+        image: "{{ VAULT_IMAGE }}"
+        environment:
+          VAULT_ADDR: "https://{{ ACME_DOMAIN_NAME }}"
+        command: vault server -config=/vault/config/config.hcl
+        volumes:
+          - "{{ HASHI_VAULT_COMPOSE_SERVICE_CONFIG_PATH }}/config.hcl:/vault/config/config.hcl"
+        network_mode: host
+        healthcheck:
+          # Treat exit-codes 0 (=unsealed) **or** 2 (=sealed) as healthy
+          test: |
+            CMD-SHELL
+            vault status >/dev/null 2>&1;
+            code=$$?;
+            if [ $$code -eq 0 ] || [ $$code -eq 2 ]; then
+              exit 0;
+            else
+              exit 1;
+            fi
+          interval: 10s
+          timeout: 5s
+          retries: 5
+          start_period: 30s
+        depends_on:
+          nginx:
+            condition: service_started
+          postgresql:
+            condition: service_healthy
+      auto-unseal:
+        image: "{{ UTILS_IMAGE }}"
+        environment:
+          VAULT_ADDR: "https://{{ ACME_DOMAIN_NAME }}"
+          POSTGRES_HOST: "127.0.0.1"
+          POSTGRES_DB: "{{ HASHI_VAULT_POSTGRES_DATABASE }}"
+          POSTGRES_USER: "{{ HASHI_VAULT_POSTGRES_USERNAME }}"
+          POSTGRES_PASSWORD: "{{ HASHI_VAULT_POSTGRES_PASSWORD }}"
+          ENCRYPT_VAULT_INIT_DATA: "false"
+        # user: root
+        command: "/usr/local/bin/vault_auto_unseal.py"
+        volumes:
+          - "{{ HASHI_VAULT_COMPOSE_SERVICE_CONFIG_PATH }}/vault_auto_unseal.py:/usr/local/bin/vault_auto_unseal.py"
+        depends_on:
+          nginx:
+            condition: service_started
+          main:
+            condition: service_healthy
+    volumes:
+      postgres_data:
+        driver: local

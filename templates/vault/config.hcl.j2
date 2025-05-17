@@ -1,0 +1,16 @@
+ui              = true
+disable_mlock   = true
+
+api_addr        = "https://{{ ACME_DOMAIN_NAME }}"
+cluster_addr    = "https://{{ ACME_DOMAIN_NAME }}"
+
+listener "tcp" {
+  address         = "127.0.0.1:8200"
+  cluster_address = "127.0.0.1:8201"
+
+  tls_disable     = 1
+}
+
+storage "postgresql" {
+  connection_url = "postgres://{{ HASHI_VAULT_POSTGRES_USERNAME }}:{{ HASHI_VAULT_POSTGRES_PASSWORD }}@127.0.0.1:5432/{{ HASHI_VAULT_POSTGRES_DATABASE }}?sslmode=disable"
+}

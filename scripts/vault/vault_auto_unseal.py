@@ -9,6 +9,8 @@ import requests
 from psycopg2.extras import Json
 
 DEBUG = os.getenv("DEBUG", "false").lower() in {"1", "true", "yes"}
+ENCRYPT_VAULT_INIT_DATA = os.getenv("ENCRYPT_VAULT_INIT_DATA", "true").lower() in {"1", "true", "yes"}
+
 logging.basicConfig(
     level=logging.DEBUG if DEBUG else logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -27,38 +29,88 @@ POSTGRES_ENCRYPTION_KEY = os.getenv("POSTGRES_ENCRYPTION_KEY", "my-secure-encryp
 SECRET_SHARES = int(os.getenv("SECRET_SHARES", "5"))
 SECRET_THRESHOLD = int(os.getenv("SECRET_THRESHOLD", "3"))
 
-# Encrypt and persist the init-response JSON
+# Store vault init data (optionally encrypted)
 def store_vault_init_data(data):
     with psycopg2.connect(**DB_CONFIG) as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO vault_init_data (encrypted_json)
-                VALUES (pgp_sym_encrypt(%s, %s, 'cipher-algo=aes256'));
-                """,
-                (Json(data), POSTGRES_ENCRYPTION_KEY),
-            )
+            if ENCRYPT_VAULT_INIT_DATA:
+                cur.execute(
+                    """
+                    INSERT INTO vault_init_data (encrypted_json, is_encrypted)
+                    VALUES (pgp_sym_encrypt(%s, %s, 'cipher-algo=aes256'), %s);
+                    """,
+                    (Json(data), POSTGRES_ENCRYPTION_KEY, True),
+                )
+                logger.info("Stored Vault init data in PostgreSQL (encrypted)")
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO vault_init_data (encrypted_json, is_encrypted)
+                    VALUES (%s, %s);
+                    """,
+                    (Json(data), False),
+                )
+                logger.info("Stored Vault init data in PostgreSQL (unencrypted)")
         conn.commit()
-    logger.info("Stored Vault init data in PostgreSQL")
 
-# Fetch and decrypt the most-recent init-response
+# Fetch and decrypt the init-response if necessary
 def get_vault_init_data():
     with psycopg2.connect(**DB_CONFIG) as conn:
         with conn.cursor() as cur:
+            # First check if we have an is_encrypted column
             cur.execute(
                 """
-                SELECT pgp_sym_decrypt(encrypted_json::bytea, %s)::json
-                FROM vault_init_data
-                ORDER BY id DESC
-                LIMIT 1;
-                """,
-                (POSTGRES_ENCRYPTION_KEY,),
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'vault_init_data' AND column_name = 'is_encrypted'
+                );
+                """
             )
-            row = cur.fetchone()
+            has_encryption_column = cur.fetchone()[0]
 
-    if row and DEBUG:
-        logger.debug("Decrypted Vault init data: %s", row[0])
-    return row[0] if row else None
+            if has_encryption_column:
+                cur.execute(
+                    """
+                    SELECT encrypted_json, is_encrypted
+                    FROM vault_init_data
+                    ORDER BY id DESC
+                    LIMIT 1;
+                    """
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+
+                json_data, is_encrypted = row
+
+                if is_encrypted:
+                    decrypted = cur.execute(
+                        "SELECT pgp_sym_decrypt(%s::bytea, %s)::json",
+                        (json_data, POSTGRES_ENCRYPTION_KEY)
+                    )
+                    decrypted_data = cur.fetchone()[0]
+                    if DEBUG:
+                        logger.debug("Decrypted Vault init data: %s", decrypted_data)
+                    return decrypted_data
+                else:
+                    if DEBUG:
+                        logger.debug("Unencrypted Vault init data: %s", json_data)
+                    return json_data
+            else:
+                # Backward compatibility: assume all existing data is encrypted
+                cur.execute(
+                    """
+                    SELECT pgp_sym_decrypt(encrypted_json::bytea, %s)::json
+                    FROM vault_init_data
+                    ORDER BY id DESC
+                    LIMIT 1;
+                    """,
+                    (POSTGRES_ENCRYPTION_KEY,),
+                )
+                row = cur.fetchone()
+                if row and DEBUG:
+                    logger.debug("Decrypted Vault init data (legacy): %s", row[0])
+                return row[0] if row else None
 
 # Quick status probe (initialized / sealed)
 def check_vault_status():
@@ -107,6 +159,12 @@ def unseal_vault():
             break
 
 if __name__ == "__main__":
+    # Log encryption status
+    if ENCRYPT_VAULT_INIT_DATA:
+        logger.info("Vault data encryption is enabled")
+    else:
+        logger.warning("Vault data encryption is disabled")
+
     status = check_vault_status()
 
     if not status["initialized"]:

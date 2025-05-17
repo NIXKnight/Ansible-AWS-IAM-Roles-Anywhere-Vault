@@ -3,3 +3,5 @@ collections/*
 external-roles/*
 !external-roles/.gitkeep
 *debug*
+.ansible_vault_password
+.envrc
